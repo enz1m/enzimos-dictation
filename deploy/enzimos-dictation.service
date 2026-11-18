@@ -1,0 +1,21 @@
+[Unit]
+Description=enzimOS dictation (speech to text into the focused field)
+PartOf=graphical-session.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/enzimos-dictation daemon
+Environment=XDG_CONFIG_HOME=%E
+ConfigurationDirectory=enzimos
+ConfigurationDirectoryMode=0700
+RuntimeDirectory=enzimos-dictation
+RuntimeDirectoryMode=0700
+Nice=5
+MemoryMax=64M
+TasksMax=16
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+Restart=on-failure
+[Install]
+WantedBy=graphical-session.target

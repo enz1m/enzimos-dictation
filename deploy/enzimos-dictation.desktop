@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Dictation
+GenericName=Voice typing
+Comment=Speak, and the words are typed where you are writing
+Icon=enzimos-dictation
+Exec=enzimos-dictation toggle
+Terminal=false
+StartupNotify=false
+Categories=Utility;Accessibility;
+Keywords=voice;speech;dictate;transcribe;talk;microphone;

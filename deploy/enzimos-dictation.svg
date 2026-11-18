@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Dictation</title>
+  <defs>
+    <filter id="enz-dictation-drop" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
+      <feOffset dy="2" result="blur"/>
+      <feComponentTransfer in="blur" result="shadow">
+        <feFuncA type="linear" slope="0.28"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+  </defs>
+
+  <!-- portrait keyline; handheld microphone scaled 1.08 and turned 35 deg about (64 64), nudged (-1 0) to centre its mass: mesh head circle r 33 (Slate, Iron
+       holes on a 9 px grid), charcoal handle 34 wide with round ends, aqua collar (identity) where they meet;
+       two overlapping shapes, nothing sticks out -->
+  <g transform="translate(-1 0) rotate(35 64 64) translate(64 64) scale(1.08) translate(-64 -64)">
+    <g filter="url(#enz-dictation-drop)">
+      <rect x="47.0" y="64" width="34" height="56" rx="17.0" fill="#2F3238"/>
+      <circle cx="64" cy="42" r="33" fill="#8E96A3"/>
+    </g>
+    <g fill="#5E6676">
+      <circle cx="45" cy="32" r="2.6"/><circle cx="45" cy="41" r="2.6"/><circle cx="45" cy="50" r="2.6"/><circle cx="45" cy="59" r="2.6"/><circle cx="54" cy="23" r="2.6"/><circle cx="54" cy="32" r="2.6"/><circle cx="54" cy="41" r="2.6"/><circle cx="54" cy="50" r="2.6"/><circle cx="54" cy="59" r="2.6"/><circle cx="63" cy="23" r="2.6"/><circle cx="63" cy="32" r="2.6"/><circle cx="63" cy="41" r="2.6"/><circle cx="63" cy="50" r="2.6"/><circle cx="63" cy="59" r="2.6"/><circle cx="72" cy="23" r="2.6"/><circle cx="72" cy="32" r="2.6"/><circle cx="72" cy="41" r="2.6"/><circle cx="72" cy="50" r="2.6"/><circle cx="72" cy="59" r="2.6"/><circle cx="81" cy="23" r="2.6"/><circle cx="81" cy="32" r="2.6"/><circle cx="81" cy="41" r="2.6"/><circle cx="81" cy="50" r="2.6"/><circle cx="81" cy="59" r="2.6"/>
+    </g>
+    <rect x="46.0" y="72" width="36" height="10" rx="3" fill="#22C3E6"/>
+  </g>
+</svg>
