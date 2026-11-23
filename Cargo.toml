@@ -8,6 +8,7 @@ publish = false
 description = "Hold a key, speak, and the words land in the text field you are typing in"
 
 [dependencies]
+enzui-activity = { git = "https://github.com/enz1m/enzui.git", rev = "ac1a3d759d40c9f9f26f3b80b40e508dea086776" }
 async-channel = "2"
 async-io = "2"
 base64 = "0.22"

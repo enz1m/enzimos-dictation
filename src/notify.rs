@@ -114,6 +114,7 @@ fn notify_with(
 ) -> zbus::Result<u32> {
     let mut hints = HashMap::from([
         ("category", Value::from("device")),
+        ("transient", Value::from(true)),
         ("desktop-entry", Value::from("enzimos-dictation")),
     ]);
     if let Some(level) = level {

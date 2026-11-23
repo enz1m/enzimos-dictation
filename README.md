@@ -36,11 +36,10 @@ How it works:
   it when it would run into a word (from the field's surrounding text, which
   enzUI fields report, else from what dictation typed there). When Fcitx5 (CJK input) holds the input
   method, or nothing is focused, the text goes to the clipboard instead.
-- Feedback: one desktop notification, posted over the daemon's own session-bus
-  connection and updated as the take goes from listening (with the microphone's
-  level as a bar, the `value` hint) to recognising to typed or copied. `deploy/enzimos-dictation.desktop` names it Dictation, with its
-  own icon `enzimos-dictation` (`deploy/enzimos-dictation.svg`, the enzimOS icon
-  theme's microphone, installed into the hicolor theme), and is the launcher entry.
+- Feedback: the bar shows listening, transcription and completion. Desktop
+  notifications also show the microphone level when listening and confirm when
+  text was inserted or copied. Transcripts stay out of the notification body.
+  `deploy/enzimos-dictation.desktop` provides the Dictation launcher and icon.
 
 ## Build and test
 

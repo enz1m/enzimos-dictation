@@ -1,5 +1,6 @@
 [Unit]
 Description=enzimOS dictation (speech to text into the focused field)
+ConditionPathExists=!%E/enzimos/local-ai-disabled
 PartOf=graphical-session.target
 [Service]
 Type=simple

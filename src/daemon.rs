@@ -7,6 +7,7 @@ use crate::deliver::{Deliverer, Outcome};
 use crate::notify::Notifier;
 use crate::record::Recording;
 use crate::{transcribe, wav};
+use enzui_activity::{Job, Outcome as ActivityOutcome, Publisher, Status, Visibility};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ const HOLD: Duration = Duration::from_millis(400);
 
 const LISTENING: &str = "Listening…";
 const HOLDING: &str = "Let go of Super+H when you are done, or tap it to keep listening";
+const TRANSCRIBING: &str = "Transcribing speech…";
 const HANDS_FREE: &str = "Stops when you pause, or press Super+H";
 
 /// The quiet after speech that ends a hands-free take.
@@ -46,7 +48,7 @@ enum Event {
         allowed: bool,
     },
     /// The speech service's answer for the take.
-    Heard(Result<String, String>),
+    Heard(Result<Option<String>, String>),
 }
 
 pub(crate) fn run(config: &Config) -> Result<(), String> {
@@ -79,6 +81,8 @@ pub(crate) fn run(config: &Config) -> Result<(), String> {
         prompt_id: 0,
         pause: wav::Pause::new(PAUSE),
         notifier: Notifier::default(),
+        activity: Publisher::new("dev.enzui.Dictation").ok(),
+        voice_job: None,
         deliverer,
         events,
     };
@@ -94,11 +98,33 @@ struct Daemon {
     /// When a hands-free take has paused for good.
     pause: wav::Pause,
     notifier: Notifier,
+    activity: Option<Publisher>,
+    voice_job: Option<Job>,
     deliverer: Deliverer,
     events: Sender<Event>,
 }
 
 impl Daemon {
+    fn show_activity(&mut self, title: &str, detail: &str) {
+        let mut status = Status::running(title);
+        status.detail = detail.into();
+        if let Some(job) = &self.voice_job {
+            let _ = job.update(status);
+        } else {
+            self.voice_job = self.activity.as_ref().and_then(|publisher| {
+                publisher
+                    .start_with_visibility(status, Visibility::Always)
+                    .ok()
+            });
+        }
+    }
+
+    fn finish_activity(&mut self, outcome: ActivityOutcome) {
+        if let Some(job) = self.voice_job.take() {
+            let _ = job.finish(outcome);
+        }
+    }
+
     fn serve(&mut self, rx: &Receiver<Event>) {
         loop {
             // A take stops itself at the speech service's limit.
@@ -153,7 +179,8 @@ impl Daemon {
             (_, Phase::Asking { .. }) => "asking".into(),
             (Command::Cancel, Phase::Recognising { .. }) => {
                 self.phase = Phase::Recognising { discard: true };
-                self.notifier.show("Dictation cancelled", "", 2);
+                self.show_activity("Discarding dictation…", "Finishing the local request");
+                self.notifier.show("Discarding dictation…", "", 0);
                 "cancelling".into()
             }
             (_, Phase::Recognising { discard: true }) => "cancelling".into(),
@@ -168,6 +195,7 @@ impl Daemon {
                     if let Phase::Listening(_, hands_free) = &mut self.phase {
                         *hands_free = true;
                     }
+                    self.show_activity(LISTENING, HANDS_FREE);
                     self.notifier.show(LISTENING, HANDS_FREE, 0);
                     "listening".into()
                 }
@@ -179,6 +207,7 @@ impl Daemon {
                 {
                     recording.cancel();
                 }
+                self.finish_activity(ActivityOutcome::Cancelled);
                 self.notifier.show("Dictation cancelled", "", 2);
                 "idle".into()
             }
@@ -188,6 +217,19 @@ impl Daemon {
     }
 
     fn listen(&mut self, hands_free: bool) -> String {
+        if self
+            .config
+            .disabled
+            .as_ref()
+            .is_some_and(|marker| marker.exists())
+        {
+            self.notifier.show(
+                "Voice typing is turned off",
+                "Enable on-device AI in Settings to dictate.",
+                5,
+            );
+            return "disabled".into();
+        }
         if !consent::given(self.config.consent.as_deref()) {
             return self.ask_consent();
         }
@@ -196,6 +238,7 @@ impl Daemon {
                 self.phase = Phase::Listening(recording, hands_free);
                 self.pause = wav::Pause::new(PAUSE);
                 let body = if hands_free { HANDS_FREE } else { HOLDING };
+                self.show_activity(LISTENING, body);
                 self.notifier.show(LISTENING, body, 0);
                 "listening".into()
             }
@@ -253,51 +296,60 @@ impl Daemon {
         else {
             return "idle".into();
         };
-        let take = recording
-            .finish()
-            .and_then(|bytes| wav::prepare(&bytes, self.config.max_seconds));
-        let audio = match take {
-            Ok(wav::Take::Audio(audio)) => audio,
-            Ok(wav::Take::Silent) => {
-                self.phase = Phase::Idle;
-                self.notifier.show("Nothing was heard", "", 2);
-                return "idle".into();
-            }
-            Err(error) => {
-                self.phase = Phase::Idle;
-                self.notifier.show("Dictation failed", &error, 5);
-                return format!("error: {error}");
-            }
-        };
-        self.notifier.show("Writing down what you said…", "", 0);
+        self.show_activity(TRANSCRIBING, "Turning your speech into text on this device");
+        self.notifier
+            .show(TRANSCRIBING, "Working on this device", 0);
         let config = self.config.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let heard = transcribe::model(config.model.as_deref(), &config.inference)
-                .and_then(|model| transcribe::transcribe(&config.gateway, &model, &audio));
+            let heard = recording
+                .finish()
+                .and_then(|bytes| wav::prepare(&bytes, config.max_seconds))
+                .and_then(|take| match take {
+                    wav::Take::Silent => Ok(None),
+                    wav::Take::Audio(audio) => {
+                        let model = transcribe::model(config.model.as_deref(), &config.inference)?;
+                        transcribe::transcribe(&config.gateway, &model, &audio).map(Some)
+                    }
+                });
             let _ = events.send(Event::Heard(heard));
         });
         "recognising".into()
     }
 
-    fn heard(&mut self, result: Result<String, String>) {
+    fn heard(&mut self, result: Result<Option<String>, String>) {
         let discard = matches!(self.phase, Phase::Recognising { discard: true });
         self.phase = Phase::Idle;
         if discard {
+            self.finish_activity(ActivityOutcome::Cancelled);
+            self.notifier.show("Dictation cancelled", "", 2);
             return;
         }
-        match result {
-            Ok(text) if text.is_empty() => self.notifier.show("Nothing was heard", "", 2),
-            Ok(text) => match self.deliverer.deliver(&text) {
-                Outcome::Typed => self.notifier.show("Typed", &text, 2),
-                Outcome::Copied => self.notifier.show(
-                    "Copied to the clipboard",
-                    &format!("No text field had focus. {text}"),
-                    5,
+        let (outcome, title, body) = match result {
+            Ok(text) => match text.filter(|text| !text.is_empty()) {
+                None => (
+                    ActivityOutcome::Succeeded,
+                    "Nothing was heard",
+                    String::new(),
                 ),
-                Outcome::Failed(error) => self.notifier.show("Dictation failed", &error, 5),
+                Some(text) => match self.deliverer.deliver(&text) {
+                    Outcome::Typed => (
+                        ActivityOutcome::Succeeded,
+                        "Dictation inserted",
+                        String::new(),
+                    ),
+                    Outcome::Copied => (
+                        ActivityOutcome::Succeeded,
+                        "Dictation copied",
+                        "No text field had focus. Paste the text from the clipboard.".into(),
+                    ),
+                    Outcome::Failed(error) => (ActivityOutcome::Failed, "Dictation failed", error),
+                },
             },
-            Err(error) => self.notifier.show("Dictation failed", &error, 5),
-        }
+            Err(error) => (ActivityOutcome::Failed, "Dictation failed", error),
+        };
+        self.finish_activity(outcome);
+        self.notifier
+            .show(title, &body, if body.is_empty() { 2 } else { 5 });
     }
 }
