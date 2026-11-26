@@ -162,7 +162,7 @@ impl Prompt {
             },
             async {
                 while let Some(message) = self.signals.next().await {
-                    match message.header().member().map(|member| member.as_str()) {
+                    match message.header().member().map(zbus::names::MemberName::as_str) {
                         Some("ActionInvoked") => {
                             if let Ok((id, key)) = message.body().deserialize::<(u32, String)>()
                                 && id == self.id

@@ -21,7 +21,8 @@ mod wav;
 use std::io::Write as _;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: enzimos-dictation daemon | start | stop | toggle | cancel | status";
+const USAGE: &str =
+    "usage: enzimos-dictation daemon | start | stop | toggle | press | release | cancel | status";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
