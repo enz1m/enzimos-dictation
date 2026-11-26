@@ -341,7 +341,7 @@ impl Daemon {
                     Outcome::Copied => (
                         ActivityOutcome::Succeeded,
                         "Dictation copied",
-                        "No text field had focus. Paste the text from the clipboard.".into(),
+                        "Paste the transcript from the clipboard.".into(),
                     ),
                     Outcome::Failed(error) => (ActivityOutcome::Failed, "Dictation failed", error),
                 },

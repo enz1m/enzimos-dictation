@@ -16,7 +16,8 @@ enzimos-dictation press|release # the dictation key, as the desktop binds it
 enzimos-dictation start|stop|toggle|cancel|status  # start and toggle listen hands-free
 ```
 
-A command starts the daemon when none runs. `$XDG_CONFIG_HOME/enzimos/dictation.json`
+The enzimOS desktop starts the service through `enzui-session-ready.target`. A command
+starts the daemon when none runs. `$XDG_CONFIG_HOME/enzimos/dictation.json`
 may set `model` (default: the speech model chosen in the inference service, with
 `enzimos-inference-models default ID`, else `whisper-base`), `gateway_socket`,
 `inference_socket` and `max_seconds` (at most 60, the speech service's limit).
@@ -31,11 +32,12 @@ How it works:
 
 - Recording: PipeWire `pw-record`, 16 kHz mono 16-bit, into the private runtime
   directory; a take that is too short or too quiet is dropped without being sent.
-- Typing: the daemon is the session's input method (`zwp_input_method_v2`), so
-  the text is committed into the focused field as if typed, with a space before
-  it when it would run into a word (from the field's surrounding text, which
-  enzUI fields report, else from what dictation typed there). When Fcitx5 (CJK input) holds the input
-  method, or nothing is focused, the text goes to the clipboard instead.
+- Typing: the daemon asks the compositor to commit text into the focused field
+  with `enzui_text_commit_v1`. The compositor admits the installed Dictation
+  executable for this request. Fcitx5 and other input methods keep their seat.
+  The compositor adds a space when needed. If the focused field uses an
+  unsupported input protocol, an IME has an active composition, or direct
+  insertion is otherwise unavailable, the transcript goes to the clipboard.
 - Feedback: the bar shows listening, transcription and completion. Desktop
   notifications also show the microphone level when listening and confirm when
   text was inserted or copied. Transcripts stay out of the notification body.
@@ -45,8 +47,9 @@ How it works:
 
 Requires Linux, Rust 1.95 or newer, PipeWire's `pw-record`, a notification server,
 and a configured local speech model through the inference service and AI gateway.
-Text insertion needs the compositor's `zwp_input_method_v2` support; clipboard
-fallback needs wlr data-control. Desktop protocol support varies. A global key
+Text insertion needs the compositor's `enzui_text_commit_v1` support. Clipboard
+fallback uses wlr data-control or `wl-copy`. Keep the protocol XML in sync
+with `protocols/enzui-text-commit-v1.xml` in the compositor fork. A global key
 binding must be configured by the desktop; building alone does not bind Super+H.
 
 ```sh
@@ -59,7 +62,7 @@ cargo fmt --check
 Tests use generated audio and fixture sockets. They do not open a microphone,
 record your desktop or contact cloud services. Installed key handling, notification
 consent and text delivery require a disposable compatible Wayland session.
-`deploy/` contains the opt-in user service and desktop entry.
+`deploy/` contains the user service and desktop entry.
 
 ## License
 

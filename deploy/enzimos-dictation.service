@@ -1,7 +1,7 @@
 [Unit]
 Description=enzimOS dictation (speech to text into the focused field)
 ConditionPathExists=!%E/enzimos/local-ai-disabled
-PartOf=graphical-session.target
+PartOf=enzui-session-ready.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/enzimos-dictation daemon
@@ -18,5 +18,3 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 Restart=on-failure
-[Install]
-WantedBy=graphical-session.target

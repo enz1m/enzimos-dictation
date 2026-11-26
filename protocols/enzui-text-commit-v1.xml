@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="enzui_text_commit_v1">
+  <copyright>SPDX-License-Identifier: MIT</copyright>
+  <interface name="enzui_text_commit_v1" version="1">
+    <description summary="insert text alongside the seat's input method">
+      This privileged interface commits text into the enabled text-input-v3
+      target of the compositor's keyboard seat. It does not obtain an input
+      method, observe field contents, or generate key events.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="commit">
+      <description summary="insert text at the current keyboard focus">
+        Text must be nonempty UTF-8, at most 4000 bytes. With space_before set
+        to 1, the compositor may add a space when the text would run into the
+        preceding word. A value of 0 requests the exact text.
+        The compositor replies once per request, in request order.
+      </description>
+      <arg name="text" type="string"/>
+      <arg name="space_before" type="uint"/>
+    </request>
+    <event name="result">
+      <description summary="whether the compositor sent the text">
+        Sent is 1 if the compositor sent a commit to the enabled text input,
+        or 0 if it could not deliver, including during an IME composition
+        or while the session is locked.
+      </description>
+      <arg name="sent" type="uint"/>
+    </event>
+  </interface>
+</protocol>

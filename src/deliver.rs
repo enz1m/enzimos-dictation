@@ -1,16 +1,10 @@
-//! Where the words go: typed into the focused text field through the
-//! input-method protocol, or, with no text field focused (or another input
-//! method in charge), put on the clipboard through data-control.
+//! Commits text at keyboard focus or offers it on the Wayland clipboard.
 
 use std::os::fd::AsRawFd as _;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, event_created_child};
-use wayland_protocols_misc::zwp_input_method_v2::client::{
-    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_input_method_v2::{self, ZwpInputMethodV2},
-};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
@@ -18,12 +12,28 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
+mod text_commit {
+    #[allow(
+        clippy::single_component_path_imports,
+        reason = "the Wayland scanner imports the client crate from its parent module"
+    )]
+    use wayland_client;
+
+    mod __interfaces {
+        wayland_scanner::generate_interfaces!("protocols/enzui-text-commit-v1.xml");
+    }
+    use self::__interfaces::*;
+    wayland_scanner::generate_client_code!("protocols/enzui-text-commit-v1.xml");
+}
+
+use text_commit::enzui_text_commit_v1::{self, EnzuiTextCommitV1};
+
 /// What happened to the words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Typed into the focused text field.
     Typed,
-    /// Put on the clipboard: no text field had focus.
+    /// Put on the clipboard when direct insertion was unavailable.
     Copied,
     Failed(String),
 }
@@ -64,21 +74,9 @@ impl Deliverer {
 #[derive(Default)]
 struct State {
     seat: Option<wl_seat::WlSeat>,
-    input_manager: Option<ZwpInputMethodManagerV2>,
     clipboard_manager: Option<ZwlrDataControlManagerV1>,
-    input: Option<ZwpInputMethodV2>,
-    /// Another input method holds the seat: this one can never type.
-    unavailable: bool,
-    /// A text field is focused, as of the last `done`.
-    active: bool,
-    pending_active: bool,
-    /// `done` events received: the serial a commit refers to.
-    serial: u32,
-    /// The text before the cursor, when the field reports it.
-    before: Option<String>,
-    pending_before: Option<String>,
-    /// Dictation typed into this field last, since it was focused.
-    typed_here: bool,
+    text_commit: Option<EnzuiTextCommitV1>,
+    text_sent: Option<bool>,
     device: Option<ZwlrDataControlDeviceV1>,
     /// The clipboard's text while this owns the selection.
     selection: Option<(ZwlrDataControlSourceV1, String)>,
@@ -97,13 +95,13 @@ fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), 
         let _ = ready.send(Err("the compositor has no seat".to_owned()));
         return;
     };
-    if let Some(manager) = &state.input_manager {
-        state.input = Some(manager.get_input_method(&seat, &qh, ()));
-    }
     if let Some(manager) = &state.clipboard_manager {
         state.device = Some(manager.get_data_device(&seat, &qh, ()));
     }
-    let _ = queue.roundtrip(&mut state);
+    if queue.roundtrip(&mut state).is_err() {
+        let _ = ready.send(Err("the compositor connection failed".to_owned()));
+        return;
+    }
     let _ = ready.send(Ok(()));
     loop {
         if dispatch(connection, &mut queue, &mut state).is_err() {
@@ -112,7 +110,7 @@ fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), 
         loop {
             match jobs.try_recv() {
                 Ok((text, reply)) => {
-                    let outcome = place(&mut state, &qh, &text);
+                    let outcome = place(&mut queue, &mut state, &text);
                     let _ = connection.flush();
                     let _ = reply.send(outcome);
                 }
@@ -140,27 +138,6 @@ fn dispatch(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::joined;
-
-    /// Dictation into a sentence keeps words apart, and does not put a
-    /// space after an opening bracket or before punctuation.
-    #[test]
-    fn dictated_words_do_not_run_into_the_text_before_them() {
-        assert_eq!(joined(Some("Hello"), false, "there"), " there");
-        assert_eq!(joined(Some("Hello "), false, "there"), "there");
-        assert_eq!(joined(Some("call ("), false, "me"), "me");
-        assert_eq!(joined(Some("Hello"), false, ", there"), ", there");
-        assert_eq!(
-            joined(None, true, "again"),
-            " again",
-            "the field does not say: after our own words"
-        );
-        assert_eq!(joined(None, false, "first"), "first");
-    }
-}
-
 #[allow(unsafe_code, reason = "poll(2) on the compositor connection")]
 fn readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
     let mut entry = libc::pollfd {
@@ -173,40 +150,29 @@ fn readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
     unsafe { libc::poll(&raw mut entry, 1, timeout_ms) > 0 }
 }
 
-fn place(state: &mut State, qh: &QueueHandle<State>, text: &str) -> Outcome {
-    if state.active
-        && !state.unavailable
-        && let Some(input) = &state.input
+fn place(queue: &mut EventQueue<State>, state: &mut State, text: &str) -> Outcome {
+    if let Some(commit) = &state.text_commit
+        && !text.is_empty()
+        && text.len() <= 4000
+        && !text.contains('\0')
     {
-        let text = joined(state.before.as_deref(), state.typed_here, text);
-        input.commit_string(text);
-        input.commit(state.serial);
-        state.typed_here = true;
-        return Outcome::Typed;
-    }
-    copy(state, qh, text)
-}
-
-/// `text` with a space before it when it would otherwise run into a word:
-/// after a letter, digit or closing punctuation before the cursor (or, when
-/// the field does not say, after earlier dictation into the same field).
-fn joined(before: Option<&str>, typed_here: bool, text: &str) -> String {
-    let after_word = match before {
-        Some(before) => before
+        let space_before = text
             .chars()
-            .next_back()
-            .is_some_and(|c| !c.is_whitespace() && !"([{\"'«¿¡".contains(c)),
-        None => typed_here,
-    };
-    let starts_word = text
-        .chars()
-        .next()
-        .is_some_and(|c| !c.is_whitespace() && !".,;:!?)]}%…".contains(c));
-    if after_word && starts_word {
-        format!(" {text}")
-    } else {
-        text.to_owned()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && !".,;:!?)]}%…".contains(c));
+        commit.commit(text.to_owned(), u32::from(space_before));
+        if queue.roundtrip(state).is_err() {
+            return Outcome::Failed("the compositor connection closed".to_owned());
+        }
+        match state.text_sent.take() {
+            Some(true) => return Outcome::Typed,
+            Some(false) => {}
+            None => {
+                return Outcome::Failed("the compositor did not confirm text delivery".to_owned());
+            }
+        }
     }
+    copy(state, &queue.handle(), text)
 }
 
 fn copy(state: &mut State, qh: &QueueHandle<State>, text: &str) -> Outcome {
@@ -273,8 +239,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "wl_seat" if state.seat.is_none() => {
                 state.seat = Some(registry.bind(name, version.min(7), qh, ()));
             }
-            "zwp_input_method_manager_v2" => {
-                state.input_manager = Some(registry.bind(name, 1, qh, ()));
+            "enzui_text_commit_v1" => {
+                state.text_commit = Some(registry.bind(name, 1, qh, ()));
             }
             "zwlr_data_control_manager_v1" => {
                 state.clipboard_manager = Some(registry.bind(name, version.min(2), qh, ()));
@@ -284,39 +250,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     }
 }
 
-impl Dispatch<ZwpInputMethodV2, ()> for State {
+impl Dispatch<EnzuiTextCommitV1, ()> for State {
     fn event(
         state: &mut Self,
-        _: &ZwpInputMethodV2,
-        event: zwp_input_method_v2::Event,
+        _: &EnzuiTextCommitV1,
+        event: enzui_text_commit_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        match event {
-            zwp_input_method_v2::Event::Activate => {
-                state.pending_active = true;
-                state.pending_before = None;
-            }
-            zwp_input_method_v2::Event::Deactivate => state.pending_active = false,
-            zwp_input_method_v2::Event::SurroundingText { text, cursor, .. } => {
-                let cursor = usize::try_from(cursor).unwrap_or(0).min(text.len());
-                state.pending_before = text.get(..cursor).map(str::to_owned);
-            }
-            zwp_input_method_v2::Event::Done => {
-                if state.pending_active && !state.active {
-                    state.typed_here = false;
-                }
-                state.active = state.pending_active;
-                state.before = state.pending_before.clone();
-                state.serial = state.serial.wrapping_add(1);
-            }
-            zwp_input_method_v2::Event::Unavailable => {
-                state.unavailable = true;
-                state.active = false;
-            }
-            _ => {}
-        }
+        let enzui_text_commit_v1::Event::Result { sent } = event;
+        state.text_sent = Some(sent == 1);
     }
 }
 
@@ -386,7 +330,6 @@ macro_rules! ignore_events {
 }
 ignore_events!(
     wl_seat::WlSeat,
-    ZwpInputMethodManagerV2,
     ZwlrDataControlManagerV1,
     ZwlrDataControlOfferV1
 );
