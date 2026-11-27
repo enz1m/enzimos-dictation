@@ -1,11 +1,10 @@
 # enzimOS Dictation
 
 Local speech-to-text for a compatible Wayland desktop.
-Hold **Super + H**, speak, let go: the words appear where you are typing. Tap
+Hold **Super + H**, speak, let go: the words are copied and appear where you are typing. Tap
 **Super + H** instead to listen hands-free: the take ends when you pause for
 a second and a half after speaking, or at the next press. **Dictation** in the
-app launcher starts a hands-free take the same way. With no
-text field focused, the words go to the clipboard. Speech is recognised by the
+app launcher starts a hands-free take the same way. Speech is recognised by the
 local AI service (`enzimos-inference-service`: Whisper base on whisper.cpp by
 default, or Parakeet TDT or Moonshine on sherpa-onnx when chosen) through
 `enzimos-ai-gateway`; nothing is sent to the cloud.
@@ -24,8 +23,7 @@ may set `model` (default: the speech model chosen in the inference service, with
 
 How it works:
 
-- Consent: the first take asks, in a notification, whether Dictation may use
-  the microphone. **Allow microphone** is remembered in
+- Consent: the Shell asks whether Dictation may use the microphone on the first take. **Allow microphone** is remembered in
   `$XDG_CONFIG_HOME/enzimos/dictation-consent` and starts the take; **Not now**
   records nothing. Delete that file to be asked again. Cancelling a take while
   it is being recognised discards the transcript.
@@ -36,19 +34,29 @@ How it works:
   with `enzui_text_commit_v1`. The compositor admits the installed Dictation
   executable for this request. Fcitx5 and other input methods keep their seat.
   The compositor adds a space when needed. If the focused field uses an
-  unsupported input protocol, an IME has an active composition, or direct
-  insertion is otherwise unavailable, the transcript goes to the clipboard.
-- Feedback: the bar shows listening, transcription and completion. Desktop
-  notifications also show the microphone level when listening and confirm when
-  text was inserted or copied. Transcripts stay out of the notification body.
+  unsupported input protocol or an IME has an active composition, the user can
+  paste the transcript from the clipboard.
+- Feedback: a dedicated Shell indicator presents listening, the live microphone
+  level, transcription and completion.
   `deploy/enzimos-dictation.desktop` provides the Dictation launcher and icon.
+
+## Shell feedback
+
+Connect to `$XDG_RUNTIME_DIR/enzimos-dictation/control.sock` and write
+`subscribe\n`. The first line reports the current state. Subsequent lines
+report state changes and `level N` samples (0–100, at most 25 per second).
+States are `idle`, `permission`, `listening`, `transcribing`, `inserted`,
+`copied`, `no-microphone`, `no-model`, `nothing-heard`, `disabled`, and
+`failed`. A result older than 1.5 seconds is reported as idle to new
+subscribers. The Shell replies to a pending permission request over a
+separate connection with `allow` or `deny`.
 
 ## Build and test
 
-Requires Linux, Rust 1.95 or newer, PipeWire's `pw-record`, a notification server,
+Requires Linux, Rust 1.95 or newer, PipeWire's `pw-record`, a compatible Shell,
 and a configured local speech model through the inference service and AI gateway.
 Text insertion needs the compositor's `enzui_text_commit_v1` support. Clipboard
-fallback uses wlr data-control or `wl-copy`. Keep the protocol XML in sync
+delivery uses wlr data-control or `wl-copy`. Keep the protocol XML in sync
 with `protocols/enzui-text-commit-v1.xml` in the compositor fork. A global key
 binding must be configured by the desktop; building alone does not bind Super+H.
 
@@ -60,7 +68,7 @@ cargo fmt --check
 ```
 
 Tests use generated audio and fixture sockets. They do not open a microphone,
-record your desktop or contact cloud services. Installed key handling, notification
+record your desktop or contact cloud services. Installed key handling, microphone
 consent and text delivery require a disposable compatible Wayland session.
 `deploy/` contains the user service and desktop entry.
 

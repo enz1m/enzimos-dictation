@@ -1,4 +1,4 @@
-//! Commits text at keyboard focus or offers it on the Wayland clipboard.
+//! Offers text on the Wayland clipboard and commits it at keyboard focus.
 
 use std::os::fd::AsRawFd as _;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -31,7 +31,7 @@ use text_commit::enzui_text_commit_v1::{self, EnzuiTextCommitV1};
 /// What happened to the words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// Typed into the focused text field.
+    /// Copied and typed into the focused text field.
     Typed,
     /// Put on the clipboard when direct insertion was unavailable.
     Copied,
@@ -111,7 +111,10 @@ fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), 
             match jobs.try_recv() {
                 Ok((text, reply)) => {
                     let outcome = place(&mut queue, &mut state, &text);
-                    let _ = connection.flush();
+                    let outcome = match connection.flush() {
+                        Ok(()) => outcome,
+                        Err(_) => Outcome::Failed("the compositor connection closed".to_owned()),
+                    };
                     let _ = reply.send(outcome);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -151,6 +154,9 @@ fn readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
 }
 
 fn place(queue: &mut EventQueue<State>, state: &mut State, text: &str) -> Outcome {
+    if let Outcome::Failed(error) = copy(state, &queue.handle(), text) {
+        return Outcome::Failed(error);
+    }
     if let Some(commit) = &state.text_commit
         && !text.is_empty()
         && text.len() <= 4000
@@ -172,7 +178,7 @@ fn place(queue: &mut EventQueue<State>, state: &mut State, text: &str) -> Outcom
             }
         }
     }
-    copy(state, &queue.handle(), text)
+    Outcome::Copied
 }
 
 fn copy(state: &mut State, qh: &QueueHandle<State>, text: &str) -> Outcome {

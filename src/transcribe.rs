@@ -37,8 +37,14 @@ pub(crate) fn model(configured: Option<&str>, inference: &Path) -> Result<String
         .ok_or_else(|| "no speech model is installed".to_owned())
 }
 
+#[derive(Debug)]
+pub(crate) struct Error {
+    pub(crate) model_unavailable: bool,
+    pub(crate) detail: String,
+}
+
 /// The words in `wav` (a canonical 16 kHz mono WAV).
-pub(crate) fn transcribe(gateway: &Path, model: &str, wav: &[u8]) -> Result<String, String> {
+pub(crate) fn transcribe(gateway: &Path, model: &str, wav: &[u8]) -> Result<String, Error> {
     let body = serde_json::json!({
         "model": model,
         "wav_base64": base64::engine::general_purpose::STANDARD.encode(wav),
@@ -51,18 +57,31 @@ pub(crate) fn transcribe(gateway: &Path, model: &str, wav: &[u8]) -> Result<Stri
         Some(body.as_bytes()),
         Duration::from_secs(120),
     )
-    .map_err(|_| "the AI gateway is not running".to_owned())?;
+    .map_err(|error| Error {
+        model_unavailable: matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        detail: format!("the AI gateway could not transcribe: {error}"),
+    })?;
     let value: serde_json::Value = serde_json::from_slice(&reply).unwrap_or_default();
     if status != 200 {
-        return Err(value["error"].as_str().map_or_else(
-            || format!("speech recognition failed ({status})"),
-            str::to_owned,
-        ));
+        return Err(Error {
+            model_unavailable: matches!(status, 404 | 503)
+                || (status == 400 && value["error"] == "unknown speech model"),
+            detail: value["error"].as_str().map_or_else(
+                || format!("speech recognition failed ({status})"),
+                str::to_owned,
+            ),
+        });
     }
     value["text"]
         .as_str()
         .map(|text| text.trim().to_owned())
-        .ok_or_else(|| "speech recognition returned no text".to_owned())
+        .ok_or_else(|| Error {
+            model_unavailable: false,
+            detail: "speech recognition returned no text".into(),
+        })
 }
 
 /// One HTTP/1.1 request over a Unix socket; the status and the body.
@@ -228,10 +247,9 @@ pub(crate) mod tests {
             request.contains(r#""wav_base64":"UklGRndhdg==""#),
             "{request}"
         );
-        assert_eq!(
-            transcribe(&gateway, "whisper-base", b"x").unwrap_err(),
-            "speech model busy"
-        );
+        let error = transcribe(&gateway, "whisper-base", b"x").unwrap_err();
+        assert!(error.model_unavailable);
+        assert_eq!(error.detail, "speech model busy");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -40,6 +40,10 @@ impl Recording {
         })
     }
 
+    pub(crate) fn exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// The loudest sample of roughly the last `window` of audio, or none
     /// before the recorder has written any.
     pub(crate) fn recent_peak(&self, window: Duration) -> Option<u16> {

@@ -1,4 +1,4 @@
-//! The daemon's control socket: one command line in, one reply line out.
+//! The daemon's control socket serves commands and streams indicator updates.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -18,6 +18,8 @@ pub(crate) enum Command {
     Toggle,
     Cancel,
     Status,
+    Allow,
+    Deny,
 }
 
 impl Command {
@@ -30,13 +32,18 @@ impl Command {
             "toggle" => Self::Toggle,
             "cancel" => Self::Cancel,
             "status" => Self::Status,
+            "allow" => Self::Allow,
+            "deny" => Self::Deny,
             _ => return None,
         })
     }
 }
 
 /// A command and where its reply goes.
-pub(crate) type Request = (Command, Sender<String>);
+pub(crate) enum Request {
+    Command(Command, Sender<String>),
+    Subscribe(UnixStream),
+}
 
 /// Sends `command` to the daemon and returns its reply, starting the daemon
 /// first when none runs (a key press must not depend on a service unit).
@@ -100,10 +107,14 @@ fn serve(stream: UnixStream, requests: &Sender<Request>) -> std::io::Result<()> 
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut line = String::new();
     BufReader::new(&stream).take_line(&mut line)?;
+    if line.trim() == "subscribe" {
+        let _ = requests.send(Request::Subscribe(stream));
+        return Ok(());
+    }
     let reply = match Command::parse(&line) {
         Some(command) => {
             let (tx, rx) = std::sync::mpsc::channel();
-            if requests.send((command, tx)).is_err() {
+            if requests.send(Request::Command(command, tx)).is_err() {
                 "stopping".to_owned()
             } else {
                 rx.recv_timeout(Duration::from_secs(5))

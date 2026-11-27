@@ -4,58 +4,48 @@ use crate::config::Config;
 use crate::consent;
 use crate::control::{self, Command, Request};
 use crate::deliver::{Deliverer, Outcome};
-use crate::notify::Notifier;
+use crate::feedback::{Feedback, State};
 use crate::record::Recording;
 use crate::{transcribe, wav};
-use enzui_activity::{Job, Outcome as ActivityOutcome, Publisher, Status, Visibility};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-/// A take held this long ends when the key comes up; a shorter press (a
-/// tap) leaves it listening until the next press.
 const HOLD: Duration = Duration::from_millis(400);
-
-const LISTENING: &str = "Listening…";
-const HOLDING: &str = "Let go of Super+H when you are done, or tap it to keep listening";
-const TRANSCRIBING: &str = "Transcribing speech…";
-const HANDS_FREE: &str = "Stops when you pause, or press Super+H";
-
-/// The quiet after speech that ends a hands-free take.
 const PAUSE: Duration = Duration::from_millis(1500);
-/// How often a take is listened to, for its level and a hands-free pause.
-const LISTEN: Duration = Duration::from_millis(200);
+const LEVEL_INTERVAL: Duration = Duration::from_millis(40);
+const PAUSE_INTERVAL: Duration = Duration::from_millis(200);
+const MIC_TIMEOUT: Duration = Duration::from_secs(2);
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 
 enum Phase {
     Idle,
-    Asking {
-        id: u64,
-        // The listener ends when this sender is dropped.
-        _cancel: async_channel::Sender<()>,
-    },
-    /// The take, and whether it is hands-free (tapped, not held).
+    Asking(Instant),
     Listening(Recording, bool),
-    /// The take is with the speech service.
-    Recognising {
-        discard: bool,
-    },
+    Recognising { discard: bool },
+}
+
+struct Failure {
+    state: State,
+    detail: String,
+}
+
+impl Failure {
+    fn report(self, feedback: &mut Feedback) {
+        eprintln!("enzimos-dictation: {}", self.detail);
+        feedback.show(self.state);
+    }
 }
 
 enum Event {
     Request(Request),
-    Consent {
-        id: u64,
-        allowed: bool,
-    },
-    /// The speech service's answer for the take.
-    Heard(Result<Option<String>, String>),
+    Heard(Result<Option<String>, Failure>),
 }
 
 pub(crate) fn run(config: &Config) -> Result<(), String> {
     std::fs::create_dir_all(&config.runtime).map_err(|error| error.to_string())?;
     std::fs::set_permissions(&config.runtime, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
-    // One daemon per session: the lock lives as long as the process.
     let lock = std::fs::File::create(config.runtime.join("daemon.lock"))
         .map_err(|error| error.to_string())?;
     if lock.try_lock().is_err() {
@@ -78,11 +68,9 @@ pub(crate) fn run(config: &Config) -> Result<(), String> {
     let mut daemon = Daemon {
         config: config.clone(),
         phase: Phase::Idle,
-        prompt_id: 0,
         pause: wav::Pause::new(PAUSE),
-        notifier: Notifier::default(),
-        activity: Publisher::new("dev.enzui.Dictation").ok(),
-        voice_job: None,
+        next_pause: Instant::now(),
+        feedback: Feedback::default(),
         deliverer,
         events,
     };
@@ -94,53 +82,30 @@ pub(crate) fn run(config: &Config) -> Result<(), String> {
 struct Daemon {
     config: Config,
     phase: Phase,
-    prompt_id: u64,
-    /// When a hands-free take has paused for good.
     pause: wav::Pause,
-    notifier: Notifier,
-    activity: Option<Publisher>,
-    voice_job: Option<Job>,
+    next_pause: Instant,
+    feedback: Feedback,
     deliverer: Deliverer,
     events: Sender<Event>,
 }
 
 impl Daemon {
-    fn show_activity(&mut self, title: &str, detail: &str) {
-        let mut status = Status::running(title);
-        status.detail = detail.into();
-        if let Some(job) = &self.voice_job {
-            let _ = job.update(status);
-        } else {
-            self.voice_job = self.activity.as_ref().and_then(|publisher| {
-                publisher
-                    .start_with_visibility(status, Visibility::Always)
-                    .ok()
-            });
-        }
-    }
-
-    fn finish_activity(&mut self, outcome: ActivityOutcome) {
-        if let Some(job) = self.voice_job.take() {
-            let _ = job.finish(outcome);
-        }
-    }
-
     fn serve(&mut self, rx: &Receiver<Event>) {
         loop {
-            // A take stops itself at the speech service's limit.
             let wait = match &self.phase {
                 Phase::Listening(recording, _) => (recording.started
                     + Duration::from_secs(u64::from(self.config.max_seconds)))
                 .saturating_duration_since(Instant::now())
-                .min(LISTEN),
+                .min(LEVEL_INTERVAL),
+                Phase::Asking(deadline) => deadline.saturating_duration_since(Instant::now()),
                 _ => Duration::from_secs(3600),
             };
             match rx.recv_timeout(wait) {
-                Ok(Event::Request((command, reply))) => {
+                Ok(Event::Request(Request::Command(command, reply))) => {
                     let answer = self.command(command);
                     let _ = reply.send(answer);
                 }
-                Ok(Event::Consent { id, allowed }) => self.consent_answer(id, allowed),
+                Ok(Event::Request(Request::Subscribe(stream))) => self.feedback.subscribe(stream),
                 Ok(Event::Heard(result)) => self.heard(result),
                 Err(RecvTimeoutError::Timeout) => self.tick(),
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -148,22 +113,33 @@ impl Daemon {
         }
     }
 
-    /// A take at its length limit stops; a hands-free one also stops once
-    /// the speaker pauses.
     fn tick(&mut self) {
-        let Phase::Listening(recording, hands_free) = &self.phase else {
+        if matches!(self.phase, Phase::Asking(_)) {
+            let _ = self.command(Command::Deny);
+            return;
+        }
+        let Phase::Listening(recording, hands_free) = &mut self.phase else {
             return;
         };
+        let now = Instant::now();
+        let peak = recording.recent_peak(Duration::from_millis(65));
+        if recording.exited() || (peak.is_none() && recording.started.elapsed() >= MIC_TIMEOUT) {
+            self.discard_recording();
+            self.feedback.show(State::NoMicrophone);
+            return;
+        }
+        let mut paused = false;
+        if *hands_free && now >= self.next_pause {
+            self.next_pause = now + PAUSE_INTERVAL;
+            paused = recording
+                .recent_peak(Duration::from_millis(300))
+                .is_some_and(|peak| self.pause.observe(peak, now));
+        }
         let limit = Duration::from_secs(u64::from(self.config.max_seconds));
-        let peak = recording.recent_peak(Duration::from_millis(300));
-        let hands_free = *hands_free;
-        let paused =
-            hands_free && peak.is_some_and(|peak| self.pause.observe(peak, Instant::now()));
         if paused || recording.started.elapsed() >= limit {
-            let _ = self.command(Command::Stop);
+            let _ = self.stop();
         } else if let Some(peak) = peak {
-            let body = if hands_free { HANDS_FREE } else { HOLDING };
-            self.notifier.level(LISTENING, body, wav::level(peak));
+            self.feedback.level(wav::level(peak));
         }
     }
 
@@ -171,22 +147,33 @@ impl Daemon {
         match (command, &self.phase) {
             (Command::Status, Phase::Idle) => "idle".into(),
             (Command::Status, Phase::Listening(..)) => "listening".into(),
-            (Command::Cancel | Command::Stop, Phase::Asking { .. }) => {
+            (Command::Allow, Phase::Asking(_)) => {
                 self.phase = Phase::Idle;
-                self.notifier.close();
+                if let Err(error) = consent::grant(self.config.consent.as_deref()) {
+                    Failure {
+                        state: State::Failed,
+                        detail: error.to_string(),
+                    }
+                    .report(&mut self.feedback);
+                    "idle".into()
+                } else {
+                    self.listen(true)
+                }
+            }
+            (Command::Deny | Command::Cancel | Command::Stop, Phase::Asking(_)) => {
+                self.phase = Phase::Idle;
+                self.feedback.show(State::Idle);
                 "idle".into()
             }
-            (_, Phase::Asking { .. }) => "asking".into(),
+            (_, Phase::Asking(_)) => "asking".into(),
             (Command::Cancel, Phase::Recognising { .. }) => {
                 self.phase = Phase::Recognising { discard: true };
-                self.show_activity("Discarding dictation…", "Finishing the local request");
-                self.notifier.show("Discarding dictation…", "", 0);
+                self.feedback.show(State::Idle);
                 "cancelling".into()
             }
             (_, Phase::Recognising { discard: true }) => "cancelling".into(),
             (_, Phase::Recognising { discard: false }) => "recognising".into(),
             (Command::Press, Phase::Idle) => self.listen(false),
-            // Without a key held, the take ends on a pause.
             (Command::Start | Command::Toggle, Phase::Idle) => self.listen(true),
             (Command::Release, Phase::Listening(recording, false)) => {
                 if recording.started.elapsed() >= HOLD {
@@ -195,24 +182,26 @@ impl Daemon {
                     if let Phase::Listening(_, hands_free) = &mut self.phase {
                         *hands_free = true;
                     }
-                    self.show_activity(LISTENING, HANDS_FREE);
-                    self.notifier.show(LISTENING, HANDS_FREE, 0);
                     "listening".into()
                 }
             }
             (Command::Stop | Command::Toggle | Command::Press, Phase::Listening(..)) => self.stop(),
             (Command::Cancel, Phase::Listening(..)) => {
-                if let Phase::Listening(recording, _) =
-                    std::mem::replace(&mut self.phase, Phase::Idle)
-                {
-                    recording.cancel();
-                }
-                self.finish_activity(ActivityOutcome::Cancelled);
-                self.notifier.show("Dictation cancelled", "", 2);
+                self.discard_recording();
+                self.feedback.show(State::Idle);
                 "idle".into()
             }
-            (Command::Start | Command::Release, Phase::Listening(..)) => "listening".into(),
-            (Command::Stop | Command::Cancel | Command::Release, Phase::Idle) => "idle".into(),
+            (
+                Command::Start | Command::Release | Command::Allow | Command::Deny,
+                Phase::Listening(..),
+            ) => "listening".into(),
+            (_, Phase::Idle) => "idle".into(),
+        }
+    }
+
+    fn discard_recording(&mut self) {
+        if let Phase::Listening(recording, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
+            recording.cancel();
         }
     }
 
@@ -223,70 +212,30 @@ impl Daemon {
             .as_ref()
             .is_some_and(|marker| marker.exists())
         {
-            self.notifier.show(
-                "Voice typing is turned off",
-                "Enable on-device AI in Settings to dictate.",
-                5,
-            );
+            self.feedback.show(State::Disabled);
             return "disabled".into();
         }
         if !consent::given(self.config.consent.as_deref()) {
-            return self.ask_consent();
+            self.phase = Phase::Asking(Instant::now() + PERMISSION_TIMEOUT);
+            self.feedback.show(State::Permission);
+            return "asking".into();
         }
         match Recording::start(&self.config.runtime) {
             Ok(recording) => {
                 self.phase = Phase::Listening(recording, hands_free);
                 self.pause = wav::Pause::new(PAUSE);
-                let body = if hands_free { HANDS_FREE } else { HOLDING };
-                self.show_activity(LISTENING, body);
-                self.notifier.show(LISTENING, body, 0);
+                self.next_pause = Instant::now();
+                self.feedback.show(State::Listening);
                 "listening".into()
             }
             Err(error) => {
-                self.notifier.show("Dictation is not available", &error, 5);
+                Failure {
+                    state: State::NoMicrophone,
+                    detail: error.clone(),
+                }
+                .report(&mut self.feedback);
                 format!("error: {error}")
             }
-        }
-    }
-
-    fn ask_consent(&mut self) -> String {
-        let Some(prompt) = self.notifier.ask(
-            "Allow Dictation to use the microphone?",
-            "Speech is recognised on this computer and is not sent anywhere.",
-            &["allow", "Allow microphone", "deny", "Not now"],
-        ) else {
-            return "error: no notification service".into();
-        };
-        let (cancel, cancelled) = async_channel::bounded(1);
-        self.prompt_id = self.prompt_id.wrapping_add(1);
-        let id = self.prompt_id;
-        self.phase = Phase::Asking {
-            id,
-            _cancel: cancel,
-        };
-        let events = self.events.clone();
-        std::thread::spawn(move || {
-            let allowed = prompt.allowed(cancelled);
-            let _ = events.send(Event::Consent { id, allowed });
-        });
-        "asking".into()
-    }
-
-    fn consent_answer(&mut self, id: u64, allowed: bool) {
-        if !matches!(self.phase, Phase::Asking { id: pending, .. } if id == pending) {
-            return;
-        }
-        self.phase = Phase::Idle;
-        if !allowed {
-            self.notifier.close();
-        } else if let Err(error) = consent::grant(self.config.consent.as_deref()) {
-            self.notifier.show(
-                "Microphone permission could not be saved",
-                &error.to_string(),
-                5,
-            );
-        } else {
-            let _ = self.listen(true);
         }
     }
 
@@ -296,60 +245,72 @@ impl Daemon {
         else {
             return "idle".into();
         };
-        self.show_activity(TRANSCRIBING, "Turning your speech into text on this device");
-        self.notifier
-            .show(TRANSCRIBING, "Working on this device", 0);
+        self.feedback.show(State::Transcribing);
         let config = self.config.clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let heard = recording
-                .finish()
-                .and_then(|bytes| wav::prepare(&bytes, config.max_seconds))
-                .and_then(|take| match take {
-                    wav::Take::Silent => Ok(None),
-                    wav::Take::Audio(audio) => {
-                        let model = transcribe::model(config.model.as_deref(), &config.inference)?;
-                        transcribe::transcribe(&config.gateway, &model, &audio).map(Some)
-                    }
-                });
-            let _ = events.send(Event::Heard(heard));
+            let _ = events.send(Event::Heard(recognise(recording, &config)));
         });
         "recognising".into()
     }
 
-    fn heard(&mut self, result: Result<Option<String>, String>) {
+    fn heard(&mut self, result: Result<Option<String>, Failure>) {
         let discard = matches!(self.phase, Phase::Recognising { discard: true });
         self.phase = Phase::Idle;
         if discard {
-            self.finish_activity(ActivityOutcome::Cancelled);
-            self.notifier.show("Dictation cancelled", "", 2);
             return;
         }
-        let (outcome, title, body) = match result {
-            Ok(text) => match text.filter(|text| !text.is_empty()) {
-                None => (
-                    ActivityOutcome::Succeeded,
-                    "Nothing was heard",
-                    String::new(),
-                ),
-                Some(text) => match self.deliverer.deliver(&text) {
-                    Outcome::Typed => (
-                        ActivityOutcome::Succeeded,
-                        "Dictation inserted",
-                        String::new(),
-                    ),
-                    Outcome::Copied => (
-                        ActivityOutcome::Succeeded,
-                        "Dictation copied",
-                        "Paste the transcript from the clipboard.".into(),
-                    ),
-                    Outcome::Failed(error) => (ActivityOutcome::Failed, "Dictation failed", error),
-                },
+        let state = match result {
+            Ok(Some(text)) if !text.is_empty() => match self.deliverer.deliver(&text) {
+                Outcome::Typed => State::Inserted,
+                Outcome::Copied => State::Copied,
+                Outcome::Failed(detail) => {
+                    Failure {
+                        state: State::Failed,
+                        detail,
+                    }
+                    .report(&mut self.feedback);
+                    return;
+                }
             },
-            Err(error) => (ActivityOutcome::Failed, "Dictation failed", error),
+            Ok(_) => State::NothingHeard,
+            Err(error) => {
+                error.report(&mut self.feedback);
+                return;
+            }
         };
-        self.finish_activity(outcome);
-        self.notifier
-            .show(title, &body, if body.is_empty() { 2 } else { 5 });
+        self.feedback.show(state);
     }
+}
+
+fn recognise(recording: Recording, config: &Config) -> Result<Option<String>, Failure> {
+    let bytes = recording.finish().map_err(|detail| Failure {
+        state: State::NoMicrophone,
+        detail,
+    })?;
+    let wav::Take::Audio(audio) =
+        wav::prepare(&bytes, config.max_seconds).map_err(|detail| Failure {
+            state: State::NoMicrophone,
+            detail,
+        })?
+    else {
+        return Ok(None);
+    };
+    let model =
+        transcribe::model(config.model.as_deref(), &config.inference).map_err(|detail| {
+            Failure {
+                state: State::NoModel,
+                detail,
+            }
+        })?;
+    transcribe::transcribe(&config.gateway, &model, &audio)
+        .map(Some)
+        .map_err(|error| Failure {
+            state: if error.model_unavailable {
+                State::NoModel
+            } else {
+                State::Failed
+            },
+            detail: error.detail,
+        })
 }

@@ -1,6 +1,5 @@
 //! enzimOS dictation: press the dictation key, speak, press it again (or let
-//! it go), and the words are typed into the text field that has focus, or put
-//! on the clipboard when none has.
+//! it go), and the words go to the clipboard and the focused text field.
 //!
 //! `enzimos-dictation daemon` runs per session; `start`, `stop`, `toggle`,
 //! `cancel` and `status` drive it over its private control socket (the
@@ -13,7 +12,7 @@ mod consent;
 mod control;
 mod daemon;
 mod deliver;
-mod notify;
+mod feedback;
 mod record;
 mod transcribe;
 mod wav;
@@ -21,8 +20,7 @@ mod wav;
 use std::io::Write as _;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: enzimos-dictation daemon | start | stop | toggle | press | release | cancel | status";
+const USAGE: &str = "usage: enzimos-dictation daemon | start | stop | toggle | press | release | cancel | status | allow | deny";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
