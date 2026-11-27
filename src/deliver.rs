@@ -1,6 +1,8 @@
 //! Offers text on the Wayland clipboard and commits it at keyboard focus.
 
-use std::os::fd::AsRawFd as _;
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, BorrowedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use wayland_client::protocol::{wl_registry, wl_seat};
@@ -44,6 +46,7 @@ type Job = (String, Sender<Outcome>);
 /// The delivery thread's handle.
 pub(crate) struct Deliverer {
     jobs: Sender<Job>,
+    wake: UnixStream,
 }
 
 impl Deliverer {
@@ -52,18 +55,27 @@ impl Deliverer {
         let connection = Connection::connect_to_env()
             .map_err(|_| "no Wayland session to type into".to_owned())?;
         let (jobs, rx) = std::sync::mpsc::channel();
+        let (wake, reader) = UnixStream::pair().map_err(|error| error.to_string())?;
+        wake.set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run(&connection, &rx, &ready_tx));
+        std::thread::spawn(move || run(&connection, &rx, &reader, &ready_tx));
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| "the compositor did not answer".to_owned())??;
-        Ok(Self { jobs })
+        Ok(Self { jobs, wake })
     }
 
     /// Types or copies `text`, waiting for the outcome.
     pub(crate) fn deliver(&self, text: &str) -> Outcome {
         let (tx, rx) = std::sync::mpsc::channel();
         if self.jobs.send((text.to_owned(), tx)).is_err() {
+            return Outcome::Failed("the compositor connection closed".to_owned());
+        }
+        // A full socket already has a wakeup queued.
+        if let Err(error) = (&self.wake).write_all(&[0])
+            && error.kind() != io::ErrorKind::WouldBlock
+        {
             return Outcome::Failed("the compositor connection closed".to_owned());
         }
         rx.recv_timeout(Duration::from_secs(5))
@@ -82,7 +94,12 @@ struct State {
     selection: Option<(ZwlrDataControlSourceV1, String)>,
 }
 
-fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), String>>) {
+fn run(
+    connection: &Connection,
+    jobs: &Receiver<Job>,
+    wake: &UnixStream,
+    ready: &Sender<Result<(), String>>,
+) {
     let mut queue: EventQueue<State> = connection.new_event_queue();
     let qh = queue.handle();
     connection.display().get_registry(&qh, ());
@@ -104,7 +121,7 @@ fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), 
     }
     let _ = ready.send(Ok(()));
     loop {
-        if dispatch(connection, &mut queue, &mut state).is_err() {
+        if dispatch(connection, &mut queue, &mut state, wake).is_err() {
             return;
         }
         loop {
@@ -124,33 +141,45 @@ fn run(connection: &Connection, jobs: &Receiver<Job>, ready: &Sender<Result<(), 
     }
 }
 
-/// Reads and dispatches what the compositor sent, waiting at most 50 ms.
 fn dispatch(
     connection: &Connection,
     queue: &mut EventQueue<State>,
     state: &mut State,
+    mut wake: &UnixStream,
 ) -> Result<(), ()> {
     connection.flush().map_err(|_| ())?;
     if let Some(guard) = queue.prepare_read() {
-        let fd = guard.connection_fd().as_raw_fd();
-        if readable(fd, 50) {
+        let [wayland, jobs] = wait_for_input(guard.connection_fd(), wake).map_err(|_| ())?;
+        if wayland {
             guard.read().map_err(|_| ())?;
+        } else {
+            drop(guard);
+        }
+        if jobs {
+            let _ = wake.read(&mut [0; 64]).map_err(|_| ())?;
         }
     }
     queue.dispatch_pending(state).map_err(|_| ())?;
     Ok(())
 }
 
-#[allow(unsafe_code, reason = "poll(2) on the compositor connection")]
-fn readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
-    let mut entry = libc::pollfd {
+#[allow(unsafe_code, reason = "poll(2) on the Wayland and job sockets")]
+fn wait_for_input(wayland: BorrowedFd<'_>, wake: &UnixStream) -> io::Result<[bool; 2]> {
+    let mut fds = [wayland.as_raw_fd(), wake.as_raw_fd()].map(|fd| libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
-    };
-    // SAFETY: one valid pollfd, borrowed for the call; `fd` stays open while
-    // the read guard holding the connection lives.
-    unsafe { libc::poll(&raw mut entry, 1, timeout_ms) > 0 }
+    });
+    loop {
+        // SAFETY: Both sockets stay open and fds is valid for two entries.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } >= 0 {
+            return Ok(fds.map(|entry| entry.revents != 0));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn place(queue: &mut EventQueue<State>, state: &mut State, text: &str) -> Outcome {
