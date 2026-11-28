@@ -6,7 +6,7 @@ use crate::control::{self, Command, Request};
 use crate::deliver::{Deliverer, Outcome};
 use crate::feedback::{Feedback, State};
 use crate::record::Recording;
-use crate::{transcribe, wav};
+use crate::{streaming, transcribe, wav};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -22,7 +22,16 @@ enum Phase {
     Idle,
     Asking(Instant),
     Listening(Recording, bool),
+    Streaming(StreamingTake),
     Recognising { discard: bool },
+}
+
+struct StreamingTake {
+    id: u64,
+    started: Instant,
+    hands_free: bool,
+    finishing: bool,
+    control: streaming::Control,
 }
 
 struct Failure {
@@ -40,6 +49,8 @@ impl Failure {
 enum Event {
     Request(Request),
     Heard(Result<Option<String>, Failure>),
+    StreamProgress(u64, streaming::Progress),
+    StreamHeard(u64, Result<Option<String>, String>),
 }
 
 pub(crate) fn run(config: &Config) -> Result<(), String> {
@@ -73,6 +84,7 @@ pub(crate) fn run(config: &Config) -> Result<(), String> {
         feedback: Feedback::default(),
         deliverer,
         events,
+        stream_id: 0,
     };
     daemon.serve(&rx);
     drop(lock);
@@ -87,6 +99,7 @@ struct Daemon {
     feedback: Feedback,
     deliverer: Deliverer,
     events: Sender<Event>,
+    stream_id: u64,
 }
 
 impl Daemon {
@@ -107,6 +120,30 @@ impl Daemon {
                 }
                 Ok(Event::Request(Request::Subscribe(stream))) => self.feedback.subscribe(stream),
                 Ok(Event::Heard(result)) => self.heard(result),
+                Ok(Event::StreamProgress(id, progress)) => {
+                    if let Phase::Streaming(take) = &mut self.phase
+                        && take.id == id
+                        && !take.finishing
+                    {
+                        match progress {
+                            streaming::Progress::Peak(peak) => {
+                                self.feedback.level(wav::level(peak));
+                            }
+                            streaming::Progress::Finalizing => {
+                                take.finishing = true;
+                                self.feedback.show(State::Transcribing);
+                            }
+                        }
+                    }
+                }
+                Ok(Event::StreamHeard(id, result)) => {
+                    if matches!(&self.phase, Phase::Streaming(take) if take.id == id) {
+                        self.heard(result.map_err(|detail| Failure {
+                            state: State::Failed,
+                            detail,
+                        }));
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => self.tick(),
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -145,6 +182,7 @@ impl Daemon {
 
     fn command(&mut self, command: Command) -> String {
         match (command, &self.phase) {
+            (_, Phase::Streaming(_)) => self.streaming_command(command),
             (Command::Status, Phase::Idle) => "idle".into(),
             (Command::Status, Phase::Listening(..)) => "listening".into(),
             (Command::Allow, Phase::Asking(_)) => {
@@ -199,6 +237,40 @@ impl Daemon {
         }
     }
 
+    fn streaming_command(&mut self, command: Command) -> String {
+        let Phase::Streaming(take) = &mut self.phase else {
+            return "idle".into();
+        };
+        if matches!(command, Command::Cancel) {
+            self.phase = Phase::Idle;
+            self.feedback.show(State::Idle);
+            return "idle".into();
+        }
+        if take.finishing {
+            return "recognising".into();
+        }
+        let result = match command {
+            Command::Release if take.hands_free => return "listening".into(),
+            Command::Release if take.started.elapsed() < HOLD => {
+                take.hands_free = true;
+                take.control.hands_free()
+            }
+            Command::Release | Command::Stop | Command::Toggle | Command::Press => {
+                take.finishing = true;
+                self.feedback.show(State::Transcribing);
+                take.control.finish()
+            }
+            _ => return "listening".into(),
+        };
+        match result {
+            Ok(()) if take.finishing => "recognising".into(),
+            Ok(()) => "listening".into(),
+            // The worker may have finished on a pause before the command arrived.
+            // Its reader reports the final text or a failure.
+            Err(_) => "recognising".into(),
+        }
+    }
+
     fn discard_recording(&mut self) {
         if let Phase::Listening(recording, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
             recording.cancel();
@@ -219,6 +291,46 @@ impl Daemon {
             self.phase = Phase::Asking(Instant::now() + PERMISSION_TIMEOUT);
             self.feedback.show(State::Permission);
             return "asking".into();
+        }
+        if self.config.model.is_none()
+            && self
+                .config
+                .use_inference
+                .as_ref()
+                .is_none_or(|marker| !marker.exists())
+            && let Some(runtime) = self.config.runtime.parent()
+        {
+            match streaming::Control::connect(runtime, hands_free, self.config.max_seconds as u8) {
+                Ok(Some((control, reader))) => {
+                    self.stream_id = self.stream_id.wrapping_add(1);
+                    let id = self.stream_id;
+                    self.phase = Phase::Streaming(StreamingTake {
+                        id,
+                        started: Instant::now(),
+                        hands_free,
+                        finishing: false,
+                        control,
+                    });
+                    self.feedback.show(State::Listening);
+                    let events = self.events.clone();
+                    std::thread::spawn(move || {
+                        let result = streaming::read(reader, |progress| {
+                            let _ = events.send(Event::StreamProgress(id, progress));
+                        });
+                        let _ = events.send(Event::StreamHeard(id, result));
+                    });
+                    return "listening".into();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    Failure {
+                        state: State::Failed,
+                        detail: error.to_string(),
+                    }
+                    .report(&mut self.feedback);
+                    return format!("error: {error}");
+                }
+            }
         }
         match Recording::start(&self.config.runtime) {
             Ok(recording) => {

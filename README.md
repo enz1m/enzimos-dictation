@@ -3,9 +3,10 @@
 Local speech-to-text for a compatible Wayland desktop.
 Hold **Super + H**, speak, let go: the words are copied and appear where you are typing. Tap
 **Super + H** instead to listen hands-free: the take ends when you pause for
-a second and a half after speaking, or at the next press. **Dictation** in the
-app launcher starts a hands-free take the same way. Speech is recognised by the
-local AI service (`enzimos-inference-service`: Whisper base on whisper.cpp by
+a short pause after speaking, or at the next press. **Dictation** in the
+app launcher starts a hands-free take the same way. Dictation uses the local
+streaming English speech service when installed and running. The fallback is
+the local AI service (`enzimos-inference-service`: Whisper base on whisper.cpp by
 default, or Parakeet TDT or Moonshine on sherpa-onnx when chosen) through
 `enzimos-ai-gateway`; nothing is sent to the cloud.
 
@@ -17,8 +18,11 @@ enzimos-dictation start|stop|toggle|cancel|status  # start and toggle listen han
 
 The enzimOS desktop starts the service through `enzui-session-ready.target`. A command
 starts the daemon when none runs. `$XDG_CONFIG_HOME/enzimos/dictation.json`
-may set `model` (default: the speech model chosen in the inference service, with
-`enzimos-inference-models default ID`, else `whisper-base`), `gateway_socket`,
+may set an explicit `model` to use the inference service directly. The
+**Streaming English** switch in Settings → Agents → Voice Typing controls
+whether Dictation prefers the streaming service for new takes. Without that
+setting, the inference fallback uses its configured speech model
+(`enzimos-inference-models default ID`, else `whisper-base`). The file also accepts `gateway_socket`,
 `inference_socket` and `max_seconds` (at most 60, the speech service's limit).
 
 How it works:
@@ -28,8 +32,9 @@ How it works:
   records nothing. Delete that file to be asked again. Cancelling a take while
   it is being recognised discards the transcript.
 
-- Recording: PipeWire `pw-record`, 16 kHz mono 16-bit, into the private runtime
-  directory; a take that is too short or too quiet is dropped without being sent.
+- Recording: the streaming worker reads PipeWire audio in memory. The
+  inference fallback records 16 kHz mono PCM into the private runtime directory
+  and drops takes that are too short or too quiet.
 - Typing: the daemon asks the compositor to commit text into the focused field
   with `enzui_text_commit_v1`. The compositor admits the installed Dictation
   executable for this request. Fcitx5 and other input methods keep their seat.

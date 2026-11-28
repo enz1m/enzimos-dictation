@@ -21,6 +21,7 @@ pub(crate) struct Config {
     /// Present once the user allowed dictation to use the microphone.
     pub(crate) consent: Option<PathBuf>,
     pub(crate) disabled: Option<PathBuf>,
+    pub(crate) use_inference: Option<PathBuf>,
 }
 
 pub(crate) const SERVICE_LIMIT_SECONDS: u32 = 60;
@@ -41,6 +42,7 @@ impl Config {
         let mut config = Self::from_parts(&runtime, file.as_deref())?;
         if let Some(home) = config_home {
             config.disabled = Some(home.join("enzimos/local-ai-disabled"));
+            config.use_inference = Some(home.join("enzimos/dictation-use-inference"));
             config.consent = Some(home.join("enzimos/dictation-consent"));
         }
         Ok(config)
@@ -57,6 +59,7 @@ impl Config {
             max_seconds: SERVICE_LIMIT_SECONDS,
             consent: None,
             disabled: None,
+            use_inference: None,
         };
         let Some(text) = file.and_then(|path| std::fs::read_to_string(path).ok()) else {
             return Ok(config);

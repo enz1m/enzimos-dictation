@@ -1,6 +1,7 @@
 [Unit]
 Description=enzimOS dictation (speech to text into the focused field)
 ConditionPathExists=!%E/enzimos/local-ai-disabled
+After=enzimos-streaming-speech.service
 PartOf=enzui-session-ready.target
 [Service]
 Type=simple

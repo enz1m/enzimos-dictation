@@ -14,6 +14,7 @@ mod daemon;
 mod deliver;
 mod feedback;
 mod record;
+mod streaming;
 mod transcribe;
 mod wav;
 
